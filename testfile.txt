@@ -1,0 +1,2 @@
+QShare AES-256-GCM file encryption test.
+This text should be recovered exactly after decryption.

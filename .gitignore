@@ -1,0 +1,39 @@
+
+# ==========================
+# Environment variables
+# ==========================
+.env
+.env.*
+!.env.example
+
+# ==========================
+# Python backend
+# ==========================
+**/.venv/
+**/venv/
+**/__pycache__/
+*.py[cod]
+**/.pytest_cache/
+.pytest_cache/
+
+# ==========================
+# React frontend
+# ==========================
+**/node_modules/
+**/dist/
+**/.vite/
+
+# ==========================
+# IDE and operating system
+# ==========================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ==========================
+# Private keys and secrets
+# ==========================
+*.pem
+*.key
+secrets/
