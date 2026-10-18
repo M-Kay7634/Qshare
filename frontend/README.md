@@ -1,16 +1,20 @@
-# React + Vite
+# QShare dashboard UI
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+This is a frontend-only dashboard prototype for the QShare research project.
 
-Currently, two official plugins are available:
+## Install
+1. Copy `src/App.jsx`, `src/App.css`, and `src/index.css` into your existing `frontend/src/` folder.
+2. Keep your existing `src/main.jsx` and `package.json`.
+3. From the `frontend` folder run:
+   ```powershell
+   npm run dev
+   ```
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Current behavior
+- Responsive dashboard layout and sidebar navigation
+- Search filters the demo file list
+- Upload button selects local files and adds their metadata to the demo list
+- Clearly labelled prototype/demo status
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+## Important security note
+This is only a UI prototype. Selecting a file does not encrypt or upload it. The sample file list and security status are demo data. Do not use it to store real confidential files. Backend APIs and browser-side cryptography must be integrated and tested before making security claims.
