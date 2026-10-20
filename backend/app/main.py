@@ -14,7 +14,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr
 
@@ -27,9 +27,12 @@ from app.auth_service import (
 from app.crypto_service import decrypt_bytes, encrypt_bytes
 from app.hybrid_crypto_service import decrypt_hybrid, encrypt_hybrid
 from app.key_store import (
+    KeyAlreadyExistsError,
+    KeyStoreError,
     create_recipient_keypair,
     get_private_key,
     get_public_key,
+    validate_master_key,
 )
 from app.user_store import create_user, find_user_by_email, find_user_by_id
 from app.file_store import save_encrypted_file, list_user_files
@@ -45,6 +48,18 @@ app = FastAPI(
 )
 
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MiB prototype limit
+
+# Stop at startup if the master key for stored private keys is missing/invalid.
+validate_master_key()
+
+
+@app.exception_handler(KeyStoreError)
+async def key_store_error_handler(request, exc):
+    # Generic message on purpose: never reveal key-store details to clients.
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "The server could not access your encryption key."},
+    )
 
 app.add_middleware(
     CORSMiddleware,
@@ -280,7 +295,13 @@ async def decrypt_file(
 # ---------------------------------------------------------------------------
 @app.post("/api/hybrid/keys/me")
 def create_my_hybrid_keys(user=Depends(get_current_user)):
-    public_key = create_recipient_keypair(user["id"])
+    try:
+        public_key = create_recipient_keypair(user["id"])
+    except KeyAlreadyExistsError:
+        raise HTTPException(
+            status_code=409,
+            detail="A key pair already exists for this account.",
+        )
     return {
         "algorithm": "ML-KEM-768",
         "public_key": base64.b64encode(public_key).decode("ascii"),
