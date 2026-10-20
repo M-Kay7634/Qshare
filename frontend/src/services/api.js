@@ -28,7 +28,9 @@ export async function apiRequest(path, options = {}) {
         ? data.detail || data.message
         : data;
 
-    throw new Error(detail || `Request failed (${response.status})`);
+    const error = new Error(detail || `Request failed (${response.status})`);
+    error.status = response.status;
+    throw error;
   }
 
   return data;
@@ -64,7 +66,26 @@ export function logoutUser() {
 
 
 
+// Make sure the logged-in user has an ML-KEM key pair before encrypting.
+export async function ensureKeyPair() {
+  try {
+    await apiRequest("/api/hybrid/keys/me");
+    return; // key pair already exists
+  } catch (error) {
+    if (error.status !== 404) throw error;
+  }
+
+  try {
+    await apiRequest("/api/hybrid/keys/me", { method: "POST" });
+  } catch (error) {
+    // 409 = a key pair was created a moment ago. That is fine.
+    if (error.status !== 409) throw error;
+  }
+}
+
 export async function uploadEncryptedFile(file) {
+  await ensureKeyPair();
+
   const formData = new FormData();
   formData.append("file", file);
 
