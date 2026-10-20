@@ -1,4 +1,13 @@
-import { useMemo, useRef, useState } from "react";
+import Auth from "./pages/Auth";
+import {
+  getCurrentUser,
+  logoutUser,
+  getMyFiles,
+  uploadEncryptedFile,
+  downloadDecryptedFile,
+} from "./services/api";
+
+import { useMemo, useRef, useState, useEffect } from "react";
 import "./App.css";
 
 const initialFiles = [
@@ -24,32 +33,178 @@ function FileGlyph({ type, color }) {
 }
 
 export default function App() {
+  const [currentUser, setCurrentUser] = useState(null);
+  const userEmail =
+    currentUser?.email ||
+    currentUser?.user?.email ||
+    "Signed-in user";
+  const [authLoading, setAuthLoading] = useState(
+    Boolean(localStorage.getItem("qshare_token"))
+  );
+
+  async function loadCurrentUser() {
+    try {
+      const user = await getCurrentUser();
+      setCurrentUser(user);
+      return user;
+    } catch (error) {
+      logoutUser();
+      setCurrentUser(null);
+      return null;
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (localStorage.getItem("qshare_token")) {
+      loadCurrentUser();
+    }
+  }, []);
+
+  useEffect(() => {
+    if (currentUser) {
+      loadStoredFiles();
+    }
+  }, [currentUser]);
+
+  function handleLogout() {
+    logoutUser();
+    setCurrentUser(null);
+  }
+
+  
+  function formatFileSize(bytes) {
+      if (bytes < 1024) return `${bytes} B`;
+      if (bytes < 1024 * 1024) {
+        return `${(bytes / 1024).toFixed(1)} KB`;
+      }
+      return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    }
+
+  function formatFileDate(value) {
+    if (!value) return "—";
+
+    return new Date(value).toLocaleString([], {
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
+  }
+
+ 
+  function mapStoredFile(file, index) {
+    const extension =
+      file.name?.split(".").pop()?.toUpperCase() || "FILE";
+
+    return {
+      id: file.id,
+      name: file.name,
+      type: extension.slice(0, 4),
+      size: formatFileSize(file.original_size ?? 0),
+      date: formatFileDate(file.created_at),
+      status: file.status || "encrypted",
+      originalSize: file.original_size ?? 0,
+      encryptedSize: file.encrypted_size ?? 0,
+      color: ["blue", "violet", "orange", "pink"][index % 4],
+    };
+  }
+
+
+  async function loadStoredFiles() {
+    try {
+      const result = await getMyFiles();
+      const storedFiles = result.files || [];
+
+      setFiles(storedFiles.map(mapStoredFile));
+    } catch (error) {
+      setNotice(`Could not load files: ${error.message}`);
+    }
+  }
+
+
   const [activeNav, setActiveNav] = useState("Dashboard");
-  const [files, setFiles] = useState(initialFiles);
+  const [files, setFiles] = useState([]);
+  const [uploading, setUploading] = useState(false);
   const [search, setSearch] = useState("");
   const [notice, setNotice] = useState("");
   const inputRef = useRef(null);
+
+  const totalFiles = files.length;
+
+  const encryptedFiles = files.filter(
+    (file) => file.status?.toLowerCase() === "encrypted"
+  ).length;
+
+  const originalStorage = files.reduce(
+    (total, file) => total + (file.originalSize ?? 0),
+    0
+  );
+
+  const encryptedStorage = files.reduce(
+    (total, file) => total + (file.encryptedSize ?? 0),
+    0
+  );
 
   const visibleFiles = useMemo(
     () => files.filter((file) => file.name.toLowerCase().includes(search.toLowerCase())),
     [files, search]
   );
 
-  function handleFiles(selected) {
-    const picked = Array.from(selected || []);
-    if (!picked.length) return;
-    const added = picked.map((file, index) => ({
-      id: Date.now() + index,
-      name: file.name,
-      type: file.name.split(".").pop()?.slice(0, 4).toUpperCase() || "FILE",
-      size: file.size < 1024 * 1024 ? `${Math.max(1, Math.round(file.size / 1024))} KB` : `${(file.size / (1024 * 1024)).toFixed(1)} MB`,
-      date: "Just now",
-      status: "Ready to encrypt",
-      color: ["blue", "violet", "orange", "pink"][index % 4],
-    }));
-    setFiles((current) => [...added, ...current]);
-    setNotice(`${picked.length} file${picked.length > 1 ? "s" : ""} added to the demo list. No encryption or upload has occurred yet.`);
-    if (inputRef.current) inputRef.current.value = "";
+  
+  async function handleFiles(selected) {
+      const picked = Array.from(selected || []);
+
+      if (!picked.length || uploading) return;
+
+      setUploading(true);
+      setNotice("");
+
+      let succeeded = 0;
+      const failures = [];
+
+      try {
+        for (const file of picked) {
+          try {
+            await uploadEncryptedFile(file);
+            succeeded++;
+          } catch (error) {
+            failures.push(`${file.name}: ${error.message}`);
+          }
+        }
+
+        await loadStoredFiles();
+
+        if (failures.length) {
+          setNotice(
+            `${succeeded} file(s) encrypted and stored. ` +
+            `${failures.length} failed: ${failures.join(" | ")}`
+          );
+        } else {
+          setNotice(
+            `${succeeded} file(s) encrypted and stored successfully.`
+          );
+        }
+      } finally {
+        setUploading(false);
+
+        if (inputRef.current) {
+          inputRef.current.value = "";
+        }
+      }
+    }
+
+
+
+  if (authLoading) {
+    return (
+      <div className="auth-loading">
+        Checking your QShare session...
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    return <Auth onLogin={loadCurrentUser} />;
   }
 
   return (
@@ -72,14 +227,26 @@ export default function App() {
 
         <div className="sidebar-bottom">
           <div className="storage-card">
-            <div className="storage-top"><span>Storage used</span><strong>21.4 / 50 GB</strong></div>
+            <div className="storage-top"><span>Storage used</span><strong>{formatFileSize(originalStorage)}</strong></div>
             <div className="storage-track"><span /></div>
-            <p>42.8% of your secure space</p>
+            <p>
+              {((originalStorage / (50 * 1024 * 1024 * 1024)) * 100).toFixed(2)}%
+              of your secure space
+            </p>
           </div>
           <button className={`nav-item ${activeNav === "Settings" ? "active" : ""}`} onClick={() => setActiveNav("Settings")}><Icon>⚙</Icon><span>Settings</span></button>
           <div className="profile">
-            <div className="avatar">MK</div>
-            <div className="profile-text"><strong>My workspace</strong><span>Free plan · Demo</span></div>
+            <div className="avatar">
+              {(userEmail !== "Signed-in user"
+                ? userEmail.split("@")[0]
+                : "QS")
+                .slice(0, 2)
+                .toUpperCase()}
+            </div>
+            <div className="profile-text">
+              <strong>{userEmail}</strong>
+              <span>QShare account</span>
+            </div>
             <span className="profile-more">•••</span>
           </div>
         </div>
@@ -91,7 +258,14 @@ export default function App() {
           <div className="topbar-actions">
             <span className="secure-pill"><span className="pulse-dot" /> Secure session</span>
             <button className="icon-button" aria-label="Notifications" onClick={() => setNotice("No new notifications in this demo.")}>♧<i /></button>
-            <div className="top-avatar">MK</div>
+            <button
+              className="top-avatar logout-button"
+              onClick={handleLogout}
+              title="Sign out"
+              aria-label="Sign out"
+            >
+              ↪
+            </button>
           </div>
         </header>
 
@@ -102,7 +276,14 @@ export default function App() {
               <h1>{activeNav === "Dashboard" ? "Your files, under your control." : activeNav}</h1>
               <p className="page-subtitle">{activeNav === "Dashboard" ? "A safer place for the files that matter." : `Manage your ${activeNav.toLowerCase()} in one secure workspace.`}</p>
             </div>
-            <button className="primary-button" onClick={() => inputRef.current?.click()}><Icon>＋</Icon> Upload files</button>
+            <button
+              className="primary-button"
+              disabled={uploading}
+              onClick={() => inputRef.current?.click()}
+            >
+              <Icon>＋</Icon>
+              {uploading ? "Encrypting..." : "Upload files"}
+            </button>
             <input ref={inputRef} className="hidden-input" type="file" multiple onChange={(event) => handleFiles(event.target.files)} />
           </section>
 
@@ -128,15 +309,18 @@ export default function App() {
           <section className="stats-grid">
             <article className="stat-card">
               <div className="stat-icon violet-bg"><Icon>▤</Icon></div><div className="stat-label">Total files</div>
-              <div className="stat-value">{files.length.toString().padStart(2, "0")} <span className="stat-trend">↗ demo</span></div><div className="stat-foot">Across your workspace</div>
+              <div className="stat-value"><strong>{totalFiles.toString().padStart(2, "0")}</strong> <span className="stat-muted">stored</span></div><div className="stat-foot">Across your workspace</div>
             </article>
             <article className="stat-card">
               <div className="stat-icon green-bg"><Icon>✓</Icon></div><div className="stat-label">Encrypted files</div>
-              <div className="stat-value">{files.filter((f) => f.status === "Encrypted").length.toString().padStart(2, "0")} <span className="stat-muted">of {files.length}</span></div><div className="stat-foot">Demo status only</div>
+              <div className="stat-value"><strong>{encryptedFiles.toString().padStart(2, "0")}</strong> <span className="stat-muted">of {files.length}</span></div><div className="stat-foot">Files encrypted by QShare</div>
             </article>
             <article className="stat-card">
               <div className="stat-icon blue-bg"><Icon>⇄</Icon></div><div className="stat-label">Shared with you</div>
-              <div className="stat-value">03 <span className="stat-trend">+1 this week</span></div><div className="stat-foot">Shared file invitations</div>
+              <div className="stat-value">
+                00 <span className="stat-muted">not available</span>
+              </div>
+              <div className="stat-foot">File sharing is not connected yet</div>
             </article>
             <article className="stat-card">
               <div className="stat-icon orange-bg"><Icon>◷</Icon></div><div className="stat-label">Security score</div>
@@ -161,13 +345,30 @@ export default function App() {
                       <td><div className="file-name-cell"><FileGlyph type={file.type} color={file.color} /><div><strong>{file.name}</strong><span>{file.type} document</span></div></div></td>
                       <td className="muted-cell">{file.size}</td><td className="muted-cell">{file.date}</td>
                       <td><span className={`status-pill ${file.status === "Encrypted" ? "status-encrypted" : "status-pending"}`}><span />{file.status}</span></td>
-                      <td><button className="row-menu" aria-label={`Actions for ${file.name}`} onClick={() => setNotice(`${file.name}: actions will be available after backend integration.`)}>•••</button></td>
+                      <td>
+                        <button
+                          className="row-menu"
+                          aria-label={`Download ${file.name}`}
+                          title={`Download and decrypt ${file.name}`}
+                          onClick={async () => {
+                            try {
+                              setNotice(`Preparing ${file.name}...`);
+                              await downloadDecryptedFile(file.id, file.name);
+                              setNotice(`${file.name} downloaded successfully.`);
+                            } catch (error) {
+                              setNotice(`Download failed: ${error.message}`);
+                            }
+                          }}
+                        >
+                          ↓
+                        </button>
+                      </td>
                     </tr>
                   ))}
                   {visibleFiles.length === 0 && <tr><td colSpan="5" className="empty-state">No files match “{search}”.</td></tr>}
                 </tbody>
               </table>
-              <div className="table-footer"><span>Showing <strong>{visibleFiles.length}</strong> of <strong>{files.length}</strong> files</span><span className="demo-tag">DEMO DATA</span></div>
+              <div className="table-footer"><span>Showing <strong>{visibleFiles.length}</strong> of <strong>{files.length}</strong> files</span><span className="demo-tag">LIVE FILES</span></div>
             </div>
           </section>
 

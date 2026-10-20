@@ -61,3 +61,57 @@ export async function getCurrentUser() {
 export function logoutUser() {
   localStorage.removeItem("qshare_token");
 }
+
+
+
+export async function uploadEncryptedFile(file) {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  return apiRequest("/api/files/encrypt", {
+    method: "POST",
+    body: formData,
+  });
+}
+
+export async function getMyFiles() {
+  return apiRequest("/api/files");
+}
+
+export async function downloadDecryptedFile(fileId, filename) {
+  const token = localStorage.getItem("qshare_token");
+
+  const response = await fetch(
+    `${API_BASE_URL}/api/files/${encodeURIComponent(fileId)}/download`,
+    {
+      headers: token
+        ? { Authorization: `Bearer ${token}` }
+        : {},
+    }
+  );
+
+  if (!response.ok) {
+    let message = "Download failed.";
+
+    try {
+      const data = await response.json();
+      message = data.detail || message;
+    } catch {
+      // Keep the default message if the response isn't JSON.
+    }
+
+    throw new Error(message);
+  }
+
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = url;
+  link.download = filename || "download.bin";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}

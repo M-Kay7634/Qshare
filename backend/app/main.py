@@ -32,7 +32,11 @@ from app.key_store import (
     get_public_key,
 )
 from app.user_store import create_user, find_user_by_email, find_user_by_id
+from app.file_store import save_encrypted_file, list_user_files
+from pathlib import Path
+from urllib.parse import quote
 
+from app.file_store import get_user_file
 
 app = FastAPI(
     title="QShare API",
@@ -328,6 +332,115 @@ async def hybrid_encrypt_for_me(
         headers={
             "Content-Disposition": 'attachment; filename="qshare-hybrid.bin"',
             "X-Encryption-Format": "QSHARE-HYBRID-MLKEM768-AES256GCM-V1",
+        },
+    )
+
+
+
+@app.post("/api/files/encrypt")
+async def encrypt_and_store_file(
+    file: UploadFile = File(...),
+    user=Depends(get_current_user),
+):
+    public_key_bytes = get_public_key(user["id"])
+
+    if public_key_bytes is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Create your key pair first.",
+        )
+
+    try:
+        plaintext = await read_limited_file(file)
+
+        public_key = mlkem.MLKEM768PublicKey.from_public_bytes(
+            public_key_bytes
+        )
+
+        encrypted_data = encrypt_hybrid(plaintext, public_key)
+
+        metadata = save_encrypted_file(
+            user_id=user["id"],
+            original_name=file.filename or "file",
+            original_size=len(plaintext),
+            encrypted_data=encrypted_data,
+        )
+
+        return {
+            "success": True,
+            "message": "File encrypted and stored successfully.",
+            "file": metadata,
+        }
+
+    except HTTPException:
+        raise
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=400,
+            detail="File encryption failed.",
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not store the encrypted file.",
+        )
+    finally:
+        await file.close()
+
+
+@app.get("/api/files")
+async def get_my_files(user=Depends(get_current_user)):
+    return {
+        "files": list_user_files(user["id"])
+    }
+
+
+@app.get("/api/files/{file_id}/download")
+async def download_my_file(
+    file_id: str,
+    user=Depends(get_current_user),
+):
+    record = get_user_file(user["id"], file_id)
+
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail="File not found.",
+        )
+
+    private_key = get_private_key(user["id"])
+
+    if private_key is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Your decryption key is unavailable.",
+        )
+
+    try:
+        encrypted_data = record["path"].read_bytes()
+        plaintext = decrypt_hybrid(encrypted_data, private_key)
+    except (ValueError, InvalidTag):
+        raise HTTPException(
+            status_code=400,
+            detail="Decryption failed: invalid or modified file.",
+        )
+    except OSError:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not read the stored file.",
+        )
+
+    filename = Path(record["name"]).name or "download.bin"
+
+    return Response(
+        content=plaintext,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename*=UTF-8''{quote(filename)}"
+            ),
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
         },
     )
 
