@@ -138,4 +138,30 @@ def get_user_file(user_id, file_id):
     }
 
 
+def delete_user_file(user_id, file_id):
+    """Delete one of the user's files (database row + encrypted file).
+
+    Returns True if a file was deleted, False if this user has no such file.
+    Works even if the encrypted file itself is already missing from disk.
+    """
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT encrypted_name FROM encrypted_files "
+            "WHERE id = ? AND user_id = ?",
+            (file_id, str(user_id)),
+        ).fetchone()
+
+        if row is None:
+            return False
+
+        connection.execute(
+            "DELETE FROM encrypted_files WHERE id = ? AND user_id = ?",
+            (file_id, str(user_id)),
+        )
+
+    # Only ever delete inside the encrypted-files folder, using just the name.
+    (STORAGE_DIR / Path(row["encrypted_name"]).name).unlink(missing_ok=True)
+    return True
+
+
 init_file_store()

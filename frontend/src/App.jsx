@@ -5,6 +5,7 @@ import {
   getMyFiles,
   uploadEncryptedFile,
   downloadDecryptedFile,
+  deleteMyFile,
 } from "./services/api";
 
 import { useMemo, useRef, useState, useEffect } from "react";
@@ -361,6 +362,24 @@ export default function App() {
                           }}
                         >
                           ↓
+                        </button>
+                        <button
+                          className="row-menu"
+                          style={{ marginLeft: 6 }}
+                          aria-label={`Delete ${file.name}`}
+                          title={`Delete ${file.name}`}
+                          onClick={async () => {
+                            if (!window.confirm(`Delete "${file.name}" permanently? This cannot be undone.`)) return;
+                            try {
+                              await deleteMyFile(file.id);
+                              await loadStoredFiles();
+                              setNotice(`${file.name} deleted.`);
+                            } catch (error) {
+                              setNotice(`Delete failed: ${error.message}`);
+                            }
+                          }}
+                        >
+                          &times;
                         </button>
                       </td>
                     </tr>

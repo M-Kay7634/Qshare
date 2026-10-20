@@ -99,6 +99,12 @@ export async function getMyFiles() {
   return apiRequest("/api/files");
 }
 
+export async function deleteMyFile(fileId) {
+  return apiRequest(`/api/files/${encodeURIComponent(fileId)}`, {
+    method: "DELETE",
+  });
+}
+
 export async function downloadDecryptedFile(fileId, filename) {
   const token = localStorage.getItem("qshare_token");
 

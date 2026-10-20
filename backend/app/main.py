@@ -30,12 +30,13 @@ from app.key_store import (
     KeyAlreadyExistsError,
     KeyStoreError,
     create_recipient_keypair,
+    file_predates_key,
     get_private_key,
     get_public_key,
     validate_master_key,
 )
 from app.user_store import create_user, find_user_by_email, find_user_by_id
-from app.file_store import save_encrypted_file, list_user_files
+from app.file_store import delete_user_file, save_encrypted_file, list_user_files
 from pathlib import Path
 from urllib.parse import quote
 
@@ -48,6 +49,11 @@ app = FastAPI(
 )
 
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MiB prototype limit
+
+LOST_KEY_DETAIL = (
+    "This file was encrypted with a key that no longer exists, "
+    "so it cannot be recovered. You can delete it."
+)
 
 # Stop at startup if the master key for stored private keys is missing/invalid.
 validate_master_key()
@@ -432,15 +438,22 @@ async def download_my_file(
     private_key = get_private_key(user["id"])
 
     if private_key is None:
+        # The file exists but this user has no key at all: it was encrypted
+        # with a key that was lost (for example before keys were saved).
         raise HTTPException(
-            status_code=404,
-            detail="Your decryption key is unavailable.",
+            status_code=410,
+            detail=LOST_KEY_DETAIL,
         )
 
     try:
         encrypted_data = record["path"].read_bytes()
         plaintext = decrypt_hybrid(encrypted_data, private_key)
     except (ValueError, InvalidTag):
+        if file_predates_key(record["created_at"], user["id"]):
+            raise HTTPException(
+                status_code=410,
+                detail=LOST_KEY_DETAIL,
+            )
         raise HTTPException(
             status_code=400,
             detail="Decryption failed: invalid or modified file.",
@@ -464,6 +477,22 @@ async def download_my_file(
             "X-Content-Type-Options": "nosniff",
         },
     )
+
+
+@app.delete("/api/files/{file_id}")
+async def delete_my_file(
+    file_id: str,
+    user=Depends(get_current_user),
+):
+    # Same answer for "not yours" and "does not exist": never reveal
+    # whether another user's file ID exists.
+    if not delete_user_file(user["id"], file_id):
+        raise HTTPException(
+            status_code=404,
+            detail="File not found.",
+        )
+
+    return {"success": True, "message": "File deleted."}
 
 
 @app.post("/api/hybrid/decrypt/me")

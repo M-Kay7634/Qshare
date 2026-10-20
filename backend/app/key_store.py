@@ -160,6 +160,31 @@ def get_public_key(user_id: str) -> bytes | None:
     return bytes(row["public_key"]) if row else None
 
 
+def get_key_created_at(user_id: str) -> str | None:
+    """When the user's current key pair was created (ISO time, UTC)."""
+    row = _fetch_active_row(user_id)
+    return row["created_at"] if row else None
+
+
+def file_predates_key(file_created_at: str, user_id: str) -> bool:
+    """True if a file was stored BEFORE the user's current key pair existed.
+
+    A user only ever has one key pair and it is never overwritten, so a file
+    older than the current key was encrypted with an earlier key that is no
+    longer available. Such a file can never be decrypted.
+    """
+    key_created_at = get_key_created_at(user_id)
+    if key_created_at is None:
+        return False
+
+    try:
+        return datetime.fromisoformat(file_created_at) < datetime.fromisoformat(
+            key_created_at
+        )
+    except ValueError:
+        return False
+
+
 def get_private_key(user_id: str) -> mlkem.MLKEM768PrivateKey | None:
     """Return the user's private key, or None if they have no key pair.
 
