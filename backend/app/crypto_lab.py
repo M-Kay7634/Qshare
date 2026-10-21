@@ -62,7 +62,12 @@ KDF_LABEL = b"QShare crypto lab v2"
 # Key establishment ("KEM") algorithms
 # ---------------------------------------------------------------------------
 class KeyEstablishment(ABC):
-    """One way of agreeing a fresh shared secret with a key holder."""
+    """One way of agreeing a fresh shared secret with a key holder.
+
+    Turning key BYTES into a usable key object is its own step (load_*),
+    because it can be expensive: RSA validates the key, ML-KEM expands its
+    seed. Benchmarks time loading and the real operation separately.
+    """
 
     def __init__(self, kem_id: int, name: str, ciphertext_size: int):
         self.kem_id = kem_id
@@ -74,12 +79,28 @@ class KeyEstablishment(ABC):
         """Return (public_key_bytes, private_key_bytes)."""
 
     @abstractmethod
-    def encapsulate(self, public_key: bytes) -> tuple[bytes, bytes]:
-        """Return (shared_secret, kem_ciphertext) for this public key."""
+    def load_public_key(self, public_key: bytes):
+        """Turn public-key bytes into a ready-to-use key object."""
 
     @abstractmethod
+    def load_private_key(self, private_key: bytes):
+        """Turn private-key bytes into a ready-to-use key object."""
+
+    @abstractmethod
+    def encapsulate_with(self, loaded_public_key) -> tuple[bytes, bytes]:
+        """Return (shared_secret, kem_ciphertext) using an already-loaded key."""
+
+    @abstractmethod
+    def decapsulate_with(self, loaded_private_key, kem_ciphertext: bytes) -> bytes:
+        """Return the shared secret using an already-loaded key."""
+
+    def encapsulate(self, public_key: bytes) -> tuple[bytes, bytes]:
+        """Load the public key, then encapsulate (what the app does per file)."""
+        return self.encapsulate_with(self.load_public_key(public_key))
+
     def decapsulate(self, private_key: bytes, kem_ciphertext: bytes) -> bytes:
-        """Return the shared secret."""
+        """Load the private key, then decapsulate (what the app does per file)."""
+        return self.decapsulate_with(self.load_private_key(private_key), kem_ciphertext)
 
 
 class MlKem(KeyEstablishment):
@@ -97,14 +118,18 @@ class MlKem(KeyEstablishment):
             private_key.private_bytes_raw(),
         )
 
-    def encapsulate(self, public_key):
-        public = self._public_cls.from_public_bytes(public_key)
-        shared_secret, kem_ciphertext = public.encapsulate()
+    def load_public_key(self, public_key):
+        return self._public_cls.from_public_bytes(public_key)
+
+    def load_private_key(self, private_key):
+        return self._private_cls.from_seed_bytes(private_key)
+
+    def encapsulate_with(self, loaded_public_key):
+        shared_secret, kem_ciphertext = loaded_public_key.encapsulate()
         return shared_secret, kem_ciphertext
 
-    def decapsulate(self, private_key, kem_ciphertext):
-        private = self._private_cls.from_seed_bytes(private_key)
-        return private.decapsulate(kem_ciphertext)
+    def decapsulate_with(self, loaded_private_key, kem_ciphertext):
+        return loaded_private_key.decapsulate(kem_ciphertext)
 
 
 class X25519Kem(KeyEstablishment):
@@ -120,16 +145,20 @@ class X25519Kem(KeyEstablishment):
             private_key.private_bytes_raw(),
         )
 
-    def encapsulate(self, public_key):
-        peer = x25519.X25519PublicKey.from_public_bytes(public_key)
+    def load_public_key(self, public_key):
+        return x25519.X25519PublicKey.from_public_bytes(public_key)
+
+    def load_private_key(self, private_key):
+        return x25519.X25519PrivateKey.from_private_bytes(private_key)
+
+    def encapsulate_with(self, loaded_public_key):
         ephemeral = x25519.X25519PrivateKey.generate()
-        shared_secret = ephemeral.exchange(peer)
+        shared_secret = ephemeral.exchange(loaded_public_key)
         return shared_secret, ephemeral.public_key().public_bytes_raw()
 
-    def decapsulate(self, private_key, kem_ciphertext):
-        private = x25519.X25519PrivateKey.from_private_bytes(private_key)
+    def decapsulate_with(self, loaded_private_key, kem_ciphertext):
         peer = x25519.X25519PublicKey.from_public_bytes(kem_ciphertext)
-        return private.exchange(peer)
+        return loaded_private_key.exchange(peer)
 
 
 class EcdhP256Kem(KeyEstablishment):
@@ -150,16 +179,22 @@ class EcdhP256Kem(KeyEstablishment):
         private_value = private_key.private_numbers().private_value
         return self._point(private_key.public_key()), private_value.to_bytes(32, "big")
 
-    def encapsulate(self, public_key):
-        peer = ec.EllipticCurvePublicKey.from_encoded_point(self._curve, public_key)
+    def load_public_key(self, public_key):
+        return ec.EllipticCurvePublicKey.from_encoded_point(self._curve, public_key)
+
+    def load_private_key(self, private_key):
+        if len(private_key) != 32:
+            raise ValueError("A P-256 private key must be exactly 32 bytes.")
+        return ec.derive_private_key(int.from_bytes(private_key, "big"), self._curve)
+
+    def encapsulate_with(self, loaded_public_key):
         ephemeral = ec.generate_private_key(self._curve)
-        shared_secret = ephemeral.exchange(ec.ECDH(), peer)
+        shared_secret = ephemeral.exchange(ec.ECDH(), loaded_public_key)
         return shared_secret, self._point(ephemeral.public_key())
 
-    def decapsulate(self, private_key, kem_ciphertext):
-        private = ec.derive_private_key(int.from_bytes(private_key, "big"), self._curve)
+    def decapsulate_with(self, loaded_private_key, kem_ciphertext):
         peer = ec.EllipticCurvePublicKey.from_encoded_point(self._curve, kem_ciphertext)
-        return private.exchange(ec.ECDH(), peer)
+        return loaded_private_key.exchange(ec.ECDH(), peer)
 
 
 class RsaOaepKem(KeyEstablishment):
@@ -189,18 +224,24 @@ class RsaOaepKem(KeyEstablishment):
         )
         return public_bytes, private_bytes
 
-    def encapsulate(self, public_key):
+    def load_public_key(self, public_key):
         public = serialization.load_der_public_key(public_key)
         if not isinstance(public, rsa.RSAPublicKey):
             raise ValueError("Not an RSA public key.")
-        shared_secret = os.urandom(32)
-        return shared_secret, public.encrypt(shared_secret, self._padding)
+        return public
 
-    def decapsulate(self, private_key, kem_ciphertext):
+    def load_private_key(self, private_key):
         private = serialization.load_der_private_key(private_key, password=None)
         if not isinstance(private, rsa.RSAPrivateKey):
             raise ValueError("Not an RSA private key.")
-        return private.decrypt(kem_ciphertext, self._padding)
+        return private
+
+    def encapsulate_with(self, loaded_public_key):
+        shared_secret = os.urandom(32)
+        return shared_secret, loaded_public_key.encrypt(shared_secret, self._padding)
+
+    def decapsulate_with(self, loaded_private_key, kem_ciphertext):
+        return loaded_private_key.decrypt(kem_ciphertext, self._padding)
 
 
 class HybridX25519MlKem768(KeyEstablishment):
@@ -225,20 +266,34 @@ class HybridX25519MlKem768(KeyEstablishment):
         pq_public, pq_private = self._post_quantum.generate_keypair()
         return classical_public + pq_public, classical_private + pq_private
 
-    def encapsulate(self, public_key):
+    def load_public_key(self, public_key):
         split = self._CLASSICAL_PUBLIC
-        classical_secret, classical_ct = self._classical.encapsulate(public_key[:split])
-        pq_secret, pq_ct = self._post_quantum.encapsulate(public_key[split:])
+        return (
+            self._classical.load_public_key(public_key[:split]),
+            self._post_quantum.load_public_key(public_key[split:]),
+        )
+
+    def load_private_key(self, private_key):
+        split = self._CLASSICAL_PRIVATE
+        return (
+            self._classical.load_private_key(private_key[:split]),
+            self._post_quantum.load_private_key(private_key[split:]),
+        )
+
+    def encapsulate_with(self, loaded_public_key):
+        classical_public, pq_public = loaded_public_key
+        classical_secret, classical_ct = self._classical.encapsulate_with(classical_public)
+        pq_secret, pq_ct = self._post_quantum.encapsulate_with(pq_public)
         return classical_secret + pq_secret, classical_ct + pq_ct
 
-    def decapsulate(self, private_key, kem_ciphertext):
-        key_split = self._CLASSICAL_PRIVATE
-        ct_split = self._CLASSICAL_CT
-        classical_secret = self._classical.decapsulate(
-            private_key[:key_split], kem_ciphertext[:ct_split]
+    def decapsulate_with(self, loaded_private_key, kem_ciphertext):
+        classical_private, pq_private = loaded_private_key
+        split = self._CLASSICAL_CT
+        classical_secret = self._classical.decapsulate_with(
+            classical_private, kem_ciphertext[:split]
         )
-        pq_secret = self._post_quantum.decapsulate(
-            private_key[key_split:], kem_ciphertext[ct_split:]
+        pq_secret = self._post_quantum.decapsulate_with(
+            pq_private, kem_ciphertext[split:]
         )
         return classical_secret + pq_secret
 
