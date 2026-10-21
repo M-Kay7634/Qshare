@@ -7,3 +7,5 @@ __pycache__/
 qshare.db
 *.db
 storage/
+
+benchmarks/results/
