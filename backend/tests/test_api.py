@@ -1,5 +1,10 @@
+"""Tests for the basic AES-256-GCM prototype endpoints.
+
+These endpoints now require a login, so each test registers a fresh user.
+"""
 
 import base64
+import uuid
 
 from fastapi.testclient import TestClient
 
@@ -7,6 +12,22 @@ from app.main import app
 from app.crypto_service import generate_key
 
 client = TestClient(app)
+
+PASSWORD = "QShare-Test-Password-2026!"
+
+
+def auth_headers():
+    """Register and log in a fresh user; return the Authorization header."""
+    email = f"api-{uuid.uuid4().hex}@example.com"
+    registered = client.post(
+        "/api/auth/register", json={"email": email, "password": PASSWORD}
+    )
+    assert registered.status_code == 201, registered.text
+    login = client.post(
+        "/api/auth/login", json={"email": email, "password": PASSWORD}
+    )
+    assert login.status_code == 200, login.text
+    return {"Authorization": f"Bearer {login.json()['access_token']}"}
 
 
 def encoded_key():
@@ -21,12 +42,13 @@ def test_health_endpoint():
 
 
 def test_encrypt_then_decrypt_file():
+    auth = auth_headers()
     key = encoded_key()
     original = b"QShare API encryption test."
 
     encrypted = client.post(
         "/api/crypto/encrypt",
-        headers={"X-Encryption-Key": key},
+        headers={**auth, "X-Encryption-Key": key},
         files={"file": ("test.txt", original, "text/plain")},
     )
 
@@ -38,7 +60,7 @@ def test_encrypt_then_decrypt_file():
 
     decrypted = client.post(
         "/api/crypto/decrypt",
-        headers={"X-Encryption-Key": key},
+        headers={**auth, "X-Encryption-Key": key},
         files={
             "file": (
                 "encrypted.bin",
@@ -53,11 +75,12 @@ def test_encrypt_then_decrypt_file():
 
 
 def test_modified_ciphertext_is_rejected():
+    auth = auth_headers()
     key = encoded_key()
 
     encrypted = client.post(
         "/api/crypto/encrypt",
-        headers={"X-Encryption-Key": key},
+        headers={**auth, "X-Encryption-Key": key},
         files={"file": ("test.txt", b"Sensitive test data", "text/plain")},
     )
 
@@ -68,7 +91,7 @@ def test_modified_ciphertext_is_rejected():
 
     response = client.post(
         "/api/crypto/decrypt",
-        headers={"X-Encryption-Key": key},
+        headers={**auth, "X-Encryption-Key": key},
         files={
             "file": (
                 "tampered.bin",
@@ -83,18 +106,19 @@ def test_modified_ciphertext_is_rejected():
 
 
 def test_wrong_key_is_rejected():
+    auth = auth_headers()
     key1 = encoded_key()
     key2 = encoded_key()
 
     encrypted = client.post(
         "/api/crypto/encrypt",
-        headers={"X-Encryption-Key": key1},
+        headers={**auth, "X-Encryption-Key": key1},
         files={"file": ("test.txt", b"Private data", "text/plain")},
     )
 
     response = client.post(
         "/api/crypto/decrypt",
-        headers={"X-Encryption-Key": key2},
+        headers={**auth, "X-Encryption-Key": key2},
         files={
             "file": (
                 "encrypted.bin",
@@ -110,7 +134,7 @@ def test_wrong_key_is_rejected():
 def test_invalid_key_is_rejected():
     response = client.post(
         "/api/crypto/encrypt",
-        headers={"X-Encryption-Key": "not-valid-base64!"},
+        headers={**auth_headers(), "X-Encryption-Key": "not-valid-base64!"},
         files={"file": ("test.txt", b"test", "text/plain")},
     )
 

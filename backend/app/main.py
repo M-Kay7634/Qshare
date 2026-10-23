@@ -11,6 +11,7 @@ from fastapi import (
     File,
     Header,
     HTTPException,
+    Request,
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +25,8 @@ from app.auth_service import (
     hash_password,
     verify_password,
 )
+from app import limits
+from app.body_limit import BodySizeLimitMiddleware
 from app.crypto_service import decrypt_bytes, encrypt_bytes
 from app.hybrid_crypto_service import decrypt_hybrid, encrypt_hybrid
 from app.key_store import (
@@ -49,6 +52,25 @@ app = FastAPI(
 )
 
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MiB prototype limit
+MAX_REQUEST_BYTES = MAX_FILE_SIZE + 1024 * 1024  # the file plus multipart overhead
+MAX_PASSWORD_LENGTH = 128  # longer passwords would only waste CPU in Argon2
+
+# Used when an email is unknown, so "no such user" takes as long as "wrong password".
+TIMING_DUMMY_DIGEST = hash_password("qshare-timing-equalizer-not-a-real-password")
+
+
+def client_ip(http_request: Request) -> str:
+    # The direct connection address. X-Forwarded-For is NOT trusted: anyone can fake it.
+    return http_request.client.host if http_request.client else "unknown"
+
+
+def too_many_requests(limiter, key, message="Too many requests. Please slow down."):
+    return HTTPException(
+        status_code=429,
+        detail=message,
+        headers={"Retry-After": str(limiter.retry_after(key))},
+    )
+
 
 LOST_KEY_DETAIL = (
     "This file was encrypted with a key that no longer exists, "
@@ -66,6 +88,8 @@ async def key_store_error_handler(request, exc):
         status_code=500,
         content={"detail": "The server could not access your encryption key."},
     )
+
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_REQUEST_BYTES)
 
 app.add_middleware(
     CORSMiddleware,
@@ -155,11 +179,23 @@ async def read_limited_file(file: UploadFile) -> bytes:
 # Account endpoints
 # ---------------------------------------------------------------------------
 @app.post("/api/auth/register", status_code=201)
-def register_user(request: RegisterRequest):
+def register_user(request: RegisterRequest, http_request: Request):
+    ip = client_ip(http_request)
+    if not limits.registrations_per_ip.hit(ip):
+        raise too_many_requests(
+            limits.registrations_per_ip, ip, "Too many new accounts from this address."
+        )
+
     if len(request.password) < 12:
         raise HTTPException(
             status_code=400,
             detail="Password must contain at least 12 characters.",
+        )
+
+    if len(request.password) > MAX_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password must contain at most {MAX_PASSWORD_LENGTH} characters.",
         )
 
     if find_user_by_email(str(request.email)):
@@ -190,17 +226,36 @@ def register_user(request: RegisterRequest):
 
 
 @app.post("/api/auth/login")
-def login_user(request: LoginRequest):
-    user = find_user_by_email(str(request.email))
-    if user is None or not verify_password(
-        request.password, user["password_hash"]
+def login_user(request: LoginRequest, http_request: Request):
+    ip = client_ip(http_request)
+    account_key = f"{ip}|{str(request.email).lower()}"
+    for limiter, key in (
+        (limits.login_failures_per_account, account_key),
+        (limits.login_failures_per_ip, ip),
     ):
+        if limiter.is_blocked(key):
+            raise too_many_requests(
+                limiter, key, "Too many failed login attempts. Try again later."
+            )
+
+    user = find_user_by_email(str(request.email))
+    if len(request.password) > MAX_PASSWORD_LENGTH:
+        password_ok = False  # refuse cheaply: never hash a huge "password"
+    else:
+        # Always do one password check, so an unknown email is not faster to reject.
+        digest = user["password_hash"] if user else TIMING_DUMMY_DIGEST
+        password_ok = verify_password(request.password, digest)
+
+    if user is None or not password_ok:
+        limits.login_failures_per_account.record(account_key)
+        limits.login_failures_per_ip.record(ip)
         raise HTTPException(
             status_code=401,
             detail="Invalid email or password.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    limits.login_failures_per_account.reset(account_key)
     token = create_access_token(user["id"])
     return {
         "access_token": token,
@@ -245,7 +300,10 @@ def health():
 async def encrypt_file(
     file: UploadFile = File(...),
     x_encryption_key: str = Header(...),
+    user=Depends(get_current_user),
 ):
+    if not limits.crypto_calls_per_user.hit(user["id"]):
+        raise too_many_requests(limits.crypto_calls_per_user, user["id"])
     key = decode_key(x_encryption_key)
     plaintext = await read_limited_file(file)
     nonce, ciphertext = encrypt_bytes(plaintext, key)
@@ -266,7 +324,10 @@ async def encrypt_file(
 async def decrypt_file(
     file: UploadFile = File(...),
     x_encryption_key: str = Header(...),
+    user=Depends(get_current_user),
 ):
+    if not limits.crypto_calls_per_user.hit(user["id"]):
+        raise too_many_requests(limits.crypto_calls_per_user, user["id"])
     key = decode_key(x_encryption_key)
     encrypted_payload = await read_limited_file(file)
 
@@ -334,6 +395,8 @@ async def hybrid_encrypt_for_me(
     file: UploadFile = File(...),
     user=Depends(get_current_user),
 ):
+    if not limits.crypto_calls_per_user.hit(user["id"]):
+        raise too_many_requests(limits.crypto_calls_per_user, user["id"])
     public_key_bytes = get_public_key(user["id"])
     if public_key_bytes is None:
         raise HTTPException(
@@ -369,6 +432,9 @@ async def encrypt_and_store_file(
     file: UploadFile = File(...),
     user=Depends(get_current_user),
 ):
+    if not limits.uploads_per_user.hit(user["id"]):
+        raise too_many_requests(limits.uploads_per_user, user["id"])
+
     public_key_bytes = get_public_key(user["id"])
 
     if public_key_bytes is None:
@@ -500,6 +566,8 @@ async def hybrid_decrypt_for_me(
     file: UploadFile = File(...),
     user=Depends(get_current_user),
 ):
+    if not limits.crypto_calls_per_user.hit(user["id"]):
+        raise too_many_requests(limits.crypto_calls_per_user, user["id"])
     private_key = get_private_key(user["id"])
     if private_key is None:
         raise HTTPException(
