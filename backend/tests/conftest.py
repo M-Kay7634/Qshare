@@ -1,6 +1,6 @@
 """Shared test setup: every test gets its own empty temporary databases,
 encrypted-file folder and key store, so tests never touch real QShare data
-and never use your real master key."""
+and never use your real master key. Rate-limit counters also start empty."""
 
 import base64
 import os
@@ -12,7 +12,7 @@ os.environ["QSHARE_MASTER_KEY"] = TEST_MASTER_KEY
 
 import pytest  # noqa: E402
 
-from app import file_store, key_store, user_store  # noqa: E402
+from app import file_store, key_store, limits, user_store  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -29,4 +29,6 @@ def isolated_storage(tmp_path, monkeypatch):
     file_store.init_file_store()
     # (key_store creates its own table automatically when first used)
 
+    limits.reset_all()  # every test starts with fresh rate-limit counters
     yield
+    limits.reset_all()
