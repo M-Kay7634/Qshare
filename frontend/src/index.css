@@ -1,0 +1,5 @@
+*{box-sizing:border-box}
+html{min-width:320px;background:#0b0d14}
+body{margin:0;min-width:320px;min-height:100vh}
+button:focus-visible,a:focus-visible,input:focus-visible{outline:2px solid #a28bff;outline-offset:3px}
+::selection{background:#6f53cb;color:#fff}

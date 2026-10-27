@@ -1,13 +1,49 @@
-
 import base64
 import binascii
+import uuid
 
+import jwt
 from cryptography.exceptions import InvalidTag
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from cryptography.hazmat.primitives.asymmetric import mlkem
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, EmailStr
 
-from app.crypto_service import encrypt_bytes, decrypt_bytes
+from app.auth_service import (
+    create_access_token,
+    decode_access_token,
+    hash_password,
+    verify_password,
+)
+from app import limits
+from app.body_limit import BodySizeLimitMiddleware
+from app.crypto_service import decrypt_bytes, encrypt_bytes
+from app.hybrid_crypto_service import decrypt_hybrid, encrypt_hybrid
+from app.key_store import (
+    KeyAlreadyExistsError,
+    KeyStoreError,
+    create_recipient_keypair,
+    file_predates_key,
+    get_private_key,
+    get_public_key,
+    validate_master_key,
+)
+from app.user_store import create_user, find_user_by_email, find_user_by_id
+from app.file_store import delete_user_file, save_encrypted_file, list_user_files
+from pathlib import Path
+from urllib.parse import quote
+
+from app.file_store import get_user_file
 
 app = FastAPI(
     title="QShare API",
@@ -15,8 +51,45 @@ app = FastAPI(
     version="0.2.0",
 )
 
-MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MiB for this initial API
+MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MiB prototype limit
+MAX_REQUEST_BYTES = MAX_FILE_SIZE + 1024 * 1024  # the file plus multipart overhead
+MAX_PASSWORD_LENGTH = 128  # longer passwords would only waste CPU in Argon2
 
+# Used when an email is unknown, so "no such user" takes as long as "wrong password".
+TIMING_DUMMY_DIGEST = hash_password("qshare-timing-equalizer-not-a-real-password")
+
+
+def client_ip(http_request: Request) -> str:
+    # The direct connection address. X-Forwarded-For is NOT trusted: anyone can fake it.
+    return http_request.client.host if http_request.client else "unknown"
+
+
+def too_many_requests(limiter, key, message="Too many requests. Please slow down."):
+    return HTTPException(
+        status_code=429,
+        detail=message,
+        headers={"Retry-After": str(limiter.retry_after(key))},
+    )
+
+
+LOST_KEY_DETAIL = (
+    "This file was encrypted with a key that no longer exists, "
+    "so it cannot be recovered. You can delete it."
+)
+
+# Stop at startup if the master key for stored private keys is missing/invalid.
+validate_master_key()
+
+
+@app.exception_handler(KeyStoreError)
+async def key_store_error_handler(request, exc):
+    # Generic message on purpose: never reveal key-store details to clients.
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "The server could not access your encryption key."},
+    )
+
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_REQUEST_BYTES)
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,6 +98,53 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Content-Type", "Authorization", "X-Encryption-Key"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# Keep this section above routes that use Depends(get_current_user).
+# ---------------------------------------------------------------------------
+security = HTTPBearer(auto_error=False)
+
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+):
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        user_id = decode_access_token(credentials.credentials)
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired access token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user = find_user_by_id(user_id)
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="User no longer exists.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return user
 
 
 def decode_key(encoded_key: str) -> bytes:
@@ -47,16 +167,115 @@ def decode_key(encoded_key: str) -> bytes:
 
 async def read_limited_file(file: UploadFile) -> bytes:
     data = await file.read(MAX_FILE_SIZE + 1)
-
     if len(data) > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=413,
             detail="File exceeds the 25 MiB prototype limit.",
         )
-
     return data
 
 
+# ---------------------------------------------------------------------------
+# Account endpoints
+# ---------------------------------------------------------------------------
+@app.post("/api/auth/register", status_code=201)
+def register_user(request: RegisterRequest, http_request: Request):
+    ip = client_ip(http_request)
+    if not limits.registrations_per_ip.hit(ip):
+        raise too_many_requests(
+            limits.registrations_per_ip, ip, "Too many new accounts from this address."
+        )
+
+    if len(request.password) < 12:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must contain at least 12 characters.",
+        )
+
+    if len(request.password) > MAX_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password must contain at most {MAX_PASSWORD_LENGTH} characters.",
+        )
+
+    if find_user_by_email(str(request.email)):
+        raise HTTPException(
+            status_code=409,
+            detail="An account with this email already exists.",
+        )
+
+    user_id = str(uuid.uuid4())
+    password_digest = hash_password(request.password)
+
+    try:
+        create_user(user_id, str(request.email), password_digest)
+    except Exception:
+        # Handle a possible duplicate-email race without exposing DB details.
+        if find_user_by_email(str(request.email)):
+            raise HTTPException(
+                status_code=409,
+                detail="An account with this email already exists.",
+            )
+        raise
+
+    return {
+        "id": user_id,
+        "email": str(request.email).lower(),
+        "message": "Account created successfully.",
+    }
+
+
+@app.post("/api/auth/login")
+def login_user(request: LoginRequest, http_request: Request):
+    ip = client_ip(http_request)
+    account_key = f"{ip}|{str(request.email).lower()}"
+    for limiter, key in (
+        (limits.login_failures_per_account, account_key),
+        (limits.login_failures_per_ip, ip),
+    ):
+        if limiter.is_blocked(key):
+            raise too_many_requests(
+                limiter, key, "Too many failed login attempts. Try again later."
+            )
+
+    user = find_user_by_email(str(request.email))
+    if len(request.password) > MAX_PASSWORD_LENGTH:
+        password_ok = False  # refuse cheaply: never hash a huge "password"
+    else:
+        # Always do one password check, so an unknown email is not faster to reject.
+        digest = user["password_hash"] if user else TIMING_DUMMY_DIGEST
+        password_ok = verify_password(request.password, digest)
+
+    if user is None or not password_ok:
+        limits.login_failures_per_account.record(account_key)
+        limits.login_failures_per_ip.record(ip)
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    limits.login_failures_per_account.reset(account_key)
+    token = create_access_token(user["id"])
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": 1800,
+    }
+
+
+@app.get("/api/auth/me")
+def read_current_user(user=Depends(get_current_user)):
+    return {
+        "id": user["id"],
+        "email": user["email"],
+        "created_at": user["created_at"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Basic service endpoints
+# ---------------------------------------------------------------------------
 @app.get("/")
 def root():
     return {
@@ -74,19 +293,23 @@ def health():
     }
 
 
+# ---------------------------------------------------------------------------
+# AES-256-GCM file encryption prototype
+# ---------------------------------------------------------------------------
 @app.post("/api/crypto/encrypt")
 async def encrypt_file(
     file: UploadFile = File(...),
     x_encryption_key: str = Header(...),
+    user=Depends(get_current_user),
 ):
+    if not limits.crypto_calls_per_user.hit(user["id"]):
+        raise too_many_requests(limits.crypto_calls_per_user, user["id"])
     key = decode_key(x_encryption_key)
     plaintext = await read_limited_file(file)
-
     nonce, ciphertext = encrypt_bytes(plaintext, key)
 
-    # Prototype file format: 12-byte nonce || ciphertext || GCM tag.
+    # File format: 12-byte nonce || AES-GCM ciphertext and authentication tag.
     encrypted_payload = nonce + ciphertext
-
     return Response(
         content=encrypted_payload,
         media_type="application/octet-stream",
@@ -101,11 +324,14 @@ async def encrypt_file(
 async def decrypt_file(
     file: UploadFile = File(...),
     x_encryption_key: str = Header(...),
+    user=Depends(get_current_user),
 ):
+    if not limits.crypto_calls_per_user.hit(user["id"]):
+        raise too_many_requests(limits.crypto_calls_per_user, user["id"])
     key = decode_key(x_encryption_key)
     encrypted_payload = await read_limited_file(file)
 
-    # A 12-byte nonce and a 16-byte GCM tag are required.
+    # 12-byte nonce plus at least a 16-byte GCM authentication tag.
     if len(encrypted_payload) < 28:
         raise HTTPException(
             status_code=400,
@@ -114,13 +340,248 @@ async def decrypt_file(
 
     nonce = encrypted_payload[:12]
     ciphertext = encrypted_payload[12:]
-
     try:
         plaintext = decrypt_bytes(ciphertext, key, nonce)
     except InvalidTag:
         raise HTTPException(
             status_code=400,
             detail="Decryption failed: wrong key or modified encrypted file.",
+        )
+
+    return Response(
+        content=plaintext,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": 'attachment; filename="qshare-decrypted.bin"',
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Authenticated hybrid ML-KEM-768 + AES-256-GCM endpoints
+# ---------------------------------------------------------------------------
+@app.post("/api/hybrid/keys/me")
+def create_my_hybrid_keys(user=Depends(get_current_user)):
+    try:
+        public_key = create_recipient_keypair(user["id"])
+    except KeyAlreadyExistsError:
+        raise HTTPException(
+            status_code=409,
+            detail="A key pair already exists for this account.",
+        )
+    return {
+        "algorithm": "ML-KEM-768",
+        "public_key": base64.b64encode(public_key).decode("ascii"),
+    }
+
+
+@app.get("/api/hybrid/keys/me")
+def read_my_hybrid_public_key(user=Depends(get_current_user)):
+    public_key = get_public_key(user["id"])
+    if public_key is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Create your key pair first.",
+        )
+
+    return {
+        "algorithm": "ML-KEM-768",
+        "public_key": base64.b64encode(public_key).decode("ascii"),
+    }
+
+
+@app.post("/api/hybrid/encrypt/me")
+async def hybrid_encrypt_for_me(
+    file: UploadFile = File(...),
+    user=Depends(get_current_user),
+):
+    if not limits.crypto_calls_per_user.hit(user["id"]):
+        raise too_many_requests(limits.crypto_calls_per_user, user["id"])
+    public_key_bytes = get_public_key(user["id"])
+    if public_key_bytes is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Create your key pair first.",
+        )
+
+    try:
+        public_key = mlkem.MLKEM768PublicKey.from_public_bytes(public_key_bytes)
+        plaintext = await read_limited_file(file)
+        payload = encrypt_hybrid(plaintext, public_key)
+    except HTTPException:
+        raise
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=400,
+            detail="Hybrid encryption failed.",
+        )
+
+    return Response(
+        content=payload,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": 'attachment; filename="qshare-hybrid.bin"',
+            "X-Encryption-Format": "QSHARE-HYBRID-MLKEM768-AES256GCM-V1",
+        },
+    )
+
+
+
+@app.post("/api/files/encrypt")
+async def encrypt_and_store_file(
+    file: UploadFile = File(...),
+    user=Depends(get_current_user),
+):
+    if not limits.uploads_per_user.hit(user["id"]):
+        raise too_many_requests(limits.uploads_per_user, user["id"])
+
+    public_key_bytes = get_public_key(user["id"])
+
+    if public_key_bytes is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Create your key pair first.",
+        )
+
+    try:
+        plaintext = await read_limited_file(file)
+
+        public_key = mlkem.MLKEM768PublicKey.from_public_bytes(
+            public_key_bytes
+        )
+
+        encrypted_data = encrypt_hybrid(plaintext, public_key)
+
+        metadata = save_encrypted_file(
+            user_id=user["id"],
+            original_name=file.filename or "file",
+            original_size=len(plaintext),
+            encrypted_data=encrypted_data,
+        )
+
+        return {
+            "success": True,
+            "message": "File encrypted and stored successfully.",
+            "file": metadata,
+        }
+
+    except HTTPException:
+        raise
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=400,
+            detail="File encryption failed.",
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not store the encrypted file.",
+        )
+    finally:
+        await file.close()
+
+
+@app.get("/api/files")
+async def get_my_files(user=Depends(get_current_user)):
+    return {
+        "files": list_user_files(user["id"])
+    }
+
+
+@app.get("/api/files/{file_id}/download")
+async def download_my_file(
+    file_id: str,
+    user=Depends(get_current_user),
+):
+    record = get_user_file(user["id"], file_id)
+
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail="File not found.",
+        )
+
+    private_key = get_private_key(user["id"])
+
+    if private_key is None:
+        # The file exists but this user has no key at all: it was encrypted
+        # with a key that was lost (for example before keys were saved).
+        raise HTTPException(
+            status_code=410,
+            detail=LOST_KEY_DETAIL,
+        )
+
+    try:
+        encrypted_data = record["path"].read_bytes()
+        plaintext = decrypt_hybrid(encrypted_data, private_key)
+    except (ValueError, InvalidTag):
+        if file_predates_key(record["created_at"], user["id"]):
+            raise HTTPException(
+                status_code=410,
+                detail=LOST_KEY_DETAIL,
+            )
+        raise HTTPException(
+            status_code=400,
+            detail="Decryption failed: invalid or modified file.",
+        )
+    except OSError:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not read the stored file.",
+        )
+
+    filename = Path(record["name"]).name or "download.bin"
+
+    return Response(
+        content=plaintext,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename*=UTF-8''{quote(filename)}"
+            ),
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.delete("/api/files/{file_id}")
+async def delete_my_file(
+    file_id: str,
+    user=Depends(get_current_user),
+):
+    # Same answer for "not yours" and "does not exist": never reveal
+    # whether another user's file ID exists.
+    if not delete_user_file(user["id"], file_id):
+        raise HTTPException(
+            status_code=404,
+            detail="File not found.",
+        )
+
+    return {"success": True, "message": "File deleted."}
+
+
+@app.post("/api/hybrid/decrypt/me")
+async def hybrid_decrypt_for_me(
+    file: UploadFile = File(...),
+    user=Depends(get_current_user),
+):
+    if not limits.crypto_calls_per_user.hit(user["id"]):
+        raise too_many_requests(limits.crypto_calls_per_user, user["id"])
+    private_key = get_private_key(user["id"])
+    if private_key is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Create your key pair first.",
+        )
+
+    payload = await read_limited_file(file)
+    try:
+        plaintext = decrypt_hybrid(payload, private_key)
+    except (ValueError, InvalidTag):
+        raise HTTPException(
+            status_code=400,
+            detail="Decryption failed: invalid, modified, or incompatible file.",
         )
 
     return Response(
